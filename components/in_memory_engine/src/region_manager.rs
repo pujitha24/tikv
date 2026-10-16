@@ -734,13 +734,13 @@ impl RegionManager {
             && region_meta.region.epoch_version == snapshot_meta.region.epoch_version
         {
             // epoch not changed
+            // Lock order: `historical_regions` before any `region_snapshot_list`,
+            // same as the slow path below.
+            let historical_regions = self.historical_regions.lock().unwrap();
             let mut snapshot_list = region_meta.region_snapshot_list.lock().unwrap();
             snapshot_list.remove_snapshot(snapshot_meta.snapshot_ts);
-            if Self::region_ready_to_evict(
-                region_meta,
-                &snapshot_list,
-                &self.historical_regions.lock().unwrap(),
-            ) {
+            if Self::region_ready_to_evict(region_meta, &snapshot_list, &historical_regions) {
+                drop(historical_regions);
                 drop(snapshot_list);
                 drop(regions_map);
                 let mut regions_map = self.regions_map.write();
@@ -783,6 +783,10 @@ impl RegionManager {
                 true
             });
             if !deletable_regions.is_empty() {
+                // Release `historical_regions` before waiting for the write lock,
+                // otherwise a fast-path reader holding `regions_map.read()` and
+                // waiting for `historical_regions` would deadlock with us.
+                drop(historical_regions);
                 drop(regions_map);
                 let mut regions_map = self.regions_map.write();
                 for r in &deletable_regions {
@@ -950,8 +954,8 @@ impl RegionManager {
         );
 
         if meta.state == RegionState::PendingEvict {
-            let snap_list = meta.region_snapshot_list.lock().unwrap();
             let historical_regions = self.historical_regions.lock().unwrap();
+            let snap_list = meta.region_snapshot_list.lock().unwrap();
             if Self::region_ready_to_evict(meta, &snap_list, &historical_regions) {
                 drop(snap_list);
                 meta.set_state(RegionState::Evicting);
@@ -1108,6 +1112,81 @@ mod tests {
 
     use super::*;
     use crate::region_manager::LoadFailedReason;
+
+    // `remove_region_snapshot` must take `historical_regions` before any
+    // `region_snapshot_list` on both its fast and slow paths, otherwise two
+    // concurrent snapshot drops can deadlock.
+    #[test]
+    fn test_remove_region_snapshot_lock_order() {
+        use std::{sync::mpsc::channel, thread, time::Duration};
+
+        let mgr = Arc::new(RegionManager::default());
+
+        // Cache B with one live snapshot, then split B. B moves to
+        // historical_regions.
+        let b = CacheRegion::new(1, 0, b"k00".to_vec(), b"k10".to_vec());
+        mgr.new_region(b.clone());
+        mgr.region_snapshot(1, 0, 8).unwrap();
+        let m = CacheRegion::new(2, 1, b"k03".to_vec(), b"k06".to_vec());
+        mgr.split_region(
+            &b,
+            vec![
+                CacheRegion::new(3, 1, b"k00".to_vec(), b"k03".to_vec()),
+                m.clone(),
+                CacheRegion::new(4, 1, b"k06".to_vec(), b"k10".to_vec()),
+            ],
+        );
+
+        // Read M, then evict it. It stays PendingEvict while the snapshot is
+        // live and B is historical.
+        mgr.region_snapshot(2, 1, 10).unwrap();
+        mgr.evict_region(&m, EvictReason::AutoEvict, None);
+        assert_eq!(
+            mgr.regions_map.read().region_meta(2).unwrap().get_state(),
+            RegionState::PendingEvict
+        );
+
+        let snap_b = RegionCacheSnapshotMeta::new(b.clone(), 8, 1);
+        let snap_m = RegionCacheSnapshotMeta::new(m, 10, 2);
+
+        // Hold B's snapshot list so that the slow path parks after taking
+        // historical_regions.
+        let hist_key = KeyAndVersion(b.end.clone(), b.epoch_version);
+        let hist_snap: &Mutex<SnapshotList> = {
+            let historical = mgr.historical_regions.lock().unwrap();
+            let meta = historical.get(&hist_key).unwrap();
+            // SAFETY: `mgr` outlives the guard, and the entry can only be removed
+            // by the slow path after it acquires this mutex.
+            unsafe { &*(meta.region_snapshot_list() as *const _) }
+        };
+        let hist_guard = hist_snap.lock().unwrap();
+
+        let (tx, rx) = channel::<()>();
+        let (mgr2, tx2) = (mgr.clone(), tx.clone());
+        let t2 = thread::spawn(move || {
+            mgr2.remove_region_snapshot(&snap_b);
+            tx2.send(()).unwrap();
+        });
+        while mgr.historical_regions.try_lock().is_ok() {
+            thread::yield_now();
+        }
+
+        let mgr3 = mgr.clone();
+        let t1 = thread::spawn(move || {
+            mgr3.remove_region_snapshot(&snap_m);
+            tx.send(()).unwrap();
+        });
+        // Give the fast path time to take whatever locks it needs first.
+        thread::sleep(Duration::from_millis(200));
+
+        drop(hist_guard);
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("remove_region_snapshot deadlocked");
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
 
     #[test]
     fn test_range_manager() {
