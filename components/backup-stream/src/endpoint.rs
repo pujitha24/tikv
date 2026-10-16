@@ -1240,7 +1240,9 @@ where
         if let Some(sender) = self.flush_done_subscribers.remove(&result.task) {
             // Send the message after the subscription manager have tried to sent this flush
             // result to subscribers.
-            self.checkpoint_mgr.sync_with_subs_mgr(move |_| {
+            // Don't wait for the manager here: it may be blocked by a subscriber that
+            // stopped reading, and this thread must keep serving other tasks.
+            let fut = self.checkpoint_mgr.defer_to_subs_mgr(move |_| {
                 if let Err(err) = sender.try_send(result) {
                     let err_msg = err.to_string();
                     let res = match err {
@@ -1249,7 +1251,8 @@ where
                     };
                     info!("failed to send flush result, waiter is gone or channel blocked"; "err" => %err_msg, "result" => ?res);
                 }
-            })
+            });
+            self.pool.spawn(root!(fut));
         }
     }
 

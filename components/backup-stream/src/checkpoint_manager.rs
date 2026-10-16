@@ -399,6 +399,29 @@ impl CheckpointManager {
         self.resolved_ts.values().map(|x| x.checkpoint).min()
     }
 
+    /// Run `f` on the subscription manager once it has handled every operation
+    /// queued before this call, without blocking the caller.
+    ///
+    /// Unlike [`Self::sync_with_subs_mgr`], the caller can run this on a
+    /// thread that must not wait for the manager, as the manager may be
+    /// stuck sending events to a subscriber that stopped reading.
+    pub fn defer_to_subs_mgr(
+        &mut self,
+        f: impl FnOnce(&SubscriptionManager) + Send + 'static,
+    ) -> BoxFuture<'static, ()> {
+        let mgr = self.manager_handle.as_ref().cloned();
+        async move {
+            let Some(mut mgr) = mgr else {
+                warn!("subscription manager not get ready, skipping the deferred operation");
+                return;
+            };
+            if let Err(err) = mgr.send(SubscriptionOp::Inspect(Box::new(f))).await {
+                warn!("failed to send deferred operation to subscription manager"; "err" => %err);
+            }
+        }
+        .boxed()
+    }
+
     pub fn sync_with_subs_mgr<T: Send + 'static>(
         &mut self,
         f: impl FnOnce(&SubscriptionManager) -> T + Send + 'static,
@@ -680,6 +703,7 @@ pub mod tests {
             let inner = MockSinkInner {
                 items: Vec::default(),
                 closed: false,
+                blocked: false,
                 on_error: Box::new(move || {
                     if failed {
                         RpcStatusCode::OK
@@ -696,9 +720,17 @@ pub mod tests {
             let inner = MockSinkInner {
                 items: Vec::default(),
                 closed: false,
+                blocked: false,
                 on_error: Box::new(|| RpcStatusCode::OK),
             };
             Self(Arc::new(Mutex::new(inner)))
+        }
+
+        /// A sink whose peer never reads: it never becomes ready.
+        fn blocked() -> Self {
+            let sink = Self::trivial();
+            sink.0.lock().unwrap().blocked = true;
+            sink
         }
 
         #[allow(clippy::unused_async)]
@@ -710,6 +742,7 @@ pub mod tests {
     struct MockSinkInner {
         items: Vec<SubscribeFlushEventResponse>,
         closed: bool,
+        blocked: bool,
         on_error: Box<dyn FnMut() -> grpcio::RpcStatusCode + Send>,
     }
 
@@ -720,6 +753,9 @@ pub mod tests {
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), Self::Error>> {
+            if self.0.lock().unwrap().blocked {
+                return std::task::Poll::Pending;
+            }
             Ok(()).into()
         }
 
@@ -780,6 +816,48 @@ pub mod tests {
         mgr.freeze_and_flush();
         mgr.sync_with_subs_mgr(|_| {});
         assert_eq!(trivial_sink.0.lock().unwrap().items.len(), 1);
+    }
+
+    #[test]
+    fn test_defer_to_subs_mgr_not_blocked_by_stuck_subscriber() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let mut mgr = super::CheckpointManager::default();
+        rt.spawn(mgr.spawn_subscription_mgr());
+        rt.block_on(mgr.add_subscriber(MockSink::blocked()))
+            .unwrap();
+
+        mgr.resolve_regions(vec![simple_resolve_result()]);
+        mgr.freeze_and_flush();
+        // The manager is now stuck feeding the blocked subscriber. Scheduling the
+        // deferred operation must still return immediately.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fut = mgr.defer_to_subs_mgr(move |_| tx.send(()).unwrap());
+        rt.block_on(fut);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn test_defer_to_subs_mgr_runs_after_pending_events() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let mut mgr = super::CheckpointManager::default();
+        rt.spawn(mgr.spawn_subscription_mgr());
+        let sink = MockSink::trivial();
+        rt.block_on(mgr.add_subscriber(sink.clone())).unwrap();
+
+        mgr.resolve_regions(vec![simple_resolve_result()]);
+        mgr.freeze_and_flush();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = sink.clone();
+        rt.block_on(
+            mgr.defer_to_subs_mgr(move |_| tx.send(probe.0.lock().unwrap().items.len()).unwrap()),
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
     }
 
     #[test]
